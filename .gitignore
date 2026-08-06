@@ -1,0 +1,26 @@
+# Gradle
+.gradle/
+build/
+**/build/
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+local.properties
+
+# Android build outputs
+captures/
+.cxx/
+.externalNativeBuild/
+
+# Signing and secrets
+*.jks
+*.keystore
+keystore.properties
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+
