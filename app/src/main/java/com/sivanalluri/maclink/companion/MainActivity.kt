@@ -16,6 +16,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Computer
 import androidx.compose.material.icons.outlined.Devices
@@ -45,11 +47,21 @@ import com.sivanalluri.maclink.companion.connection.MacConnectionManager
 import com.sivanalluri.maclink.companion.connection.PresenceConnectionState
 import com.sivanalluri.maclink.companion.connection.PresenceConnectionStatus
 import com.sivanalluri.maclink.companion.ui.theme.MacLinkTheme
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     private lateinit var discoveryManager: MacDiscoveryManager
     private lateinit var connectionManager: MacConnectionManager
+    private val pairingScanner by lazy {
+        val options = GmsBarcodeScannerOptions.Builder()
+            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+            .enableAutoZoom()
+            .build()
+        GmsBarcodeScanning.getClient(this, options)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -80,6 +92,7 @@ class MainActivity : ComponentActivity() {
                     onStop = discoveryManager::stop,
                     onConnect = connectionManager::connect,
                     onDisconnect = connectionManager::disconnect,
+                    onScanPairing = ::scanPairingCode,
                 )
             }
         }
@@ -103,6 +116,23 @@ class MainActivity : ComponentActivity() {
                 this,
                 Manifest.permission.ACCESS_LOCAL_NETWORK,
             ) == PackageManager.PERMISSION_GRANTED
+
+    private fun scanPairingCode() {
+        pairingScanner.startScan()
+            .addOnSuccessListener { barcode ->
+                val value = barcode.rawValue
+                if (value == null) {
+                    connectionManager.reportPairingError("The QR code did not contain pairing data.")
+                } else {
+                    connectionManager.beginPairing(value)
+                }
+            }
+            .addOnFailureListener { error ->
+                connectionManager.reportPairingError(
+                    error.message ?: "Unable to open the QR scanner.",
+                )
+            }
+    }
 }
 
 @Composable
@@ -113,11 +143,13 @@ private fun DiscoveryScreen(
     onStop: () -> Unit,
     onConnect: (DiscoveredMac) -> Unit,
     onDisconnect: () -> Unit,
+    onScanPairing: () -> Unit,
 ) {
     Scaffold { innerPadding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .verticalScroll(rememberScrollState())
                 .padding(innerPadding)
                 .padding(horizontal = 32.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -152,9 +184,11 @@ private fun DiscoveryScreen(
             }
 
             Spacer(Modifier.height(32.dp))
-            if (connectionState.status == PresenceConnectionStatus.DETECTED ||
-                connectionState.status == PresenceConnectionStatus.CONNECTING
+            PairingControls(connectionState, onScanPairing)
+            if (connectionState.status != PresenceConnectionStatus.IDLE &&
+                connectionState.status != PresenceConnectionStatus.ERROR
             ) {
+                Spacer(Modifier.height(8.dp))
                 OutlinedButton(onClick = onDisconnect) { Text("Disconnect") }
                 Spacer(Modifier.height(8.dp))
             }
@@ -164,6 +198,41 @@ private fun DiscoveryScreen(
                 Button(onClick = onStart) { Text("Find my Mac") }
             }
         }
+    }
+}
+
+@Composable
+private fun PairingControls(
+    connectionState: PresenceConnectionState,
+    onScanPairing: () -> Unit,
+) {
+    when (connectionState.status) {
+        PresenceConnectionStatus.DETECTED -> Button(onClick = onScanPairing) {
+            Text("Scan Pairing QR")
+        }
+        PresenceConnectionStatus.PAIRING -> CircularProgressIndicator()
+        PresenceConnectionStatus.AWAITING_APPROVAL -> Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text("Confirm this code matches your Mac", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                connectionState.verificationCode ?: "------",
+                style = MaterialTheme.typography.displaySmall,
+            )
+            Text(
+                "Approve the phone on your Mac to finish pairing.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+        }
+        PresenceConnectionStatus.PAIRED -> Text(
+            "Secure pairing saved. Encrypted sessions are the next phase.",
+            color = MaterialTheme.colorScheme.primary,
+            textAlign = TextAlign.Center,
+            style = MaterialTheme.typography.titleMedium,
+        )
+        else -> Unit
     }
 }
 
@@ -212,6 +281,12 @@ private fun MacCard(
                             "Connecting…"
                         isSelected && connectionState.status == PresenceConnectionStatus.DETECTED ->
                             "Detected by Mac"
+                        isSelected && connectionState.status == PresenceConnectionStatus.PAIRING ->
+                            "Pairing…"
+                        isSelected && connectionState.status == PresenceConnectionStatus.AWAITING_APPROVAL ->
+                            "Confirm code"
+                        isSelected && connectionState.status == PresenceConnectionStatus.PAIRED ->
+                            "Paired"
                         isSelected && connectionState.status == PresenceConnectionStatus.ERROR ->
                             "Try again"
                         else -> "Connect"
@@ -235,6 +310,9 @@ private fun discoveryTitle(
     connectionState: PresenceConnectionState,
 ): String = when {
     connectionState.status == PresenceConnectionStatus.DETECTED -> "Phone detected by Mac"
+    connectionState.status == PresenceConnectionStatus.PAIRING -> "Verifying Mac"
+    connectionState.status == PresenceConnectionStatus.AWAITING_APPROVAL -> "Confirm pairing code"
+    connectionState.status == PresenceConnectionStatus.PAIRED -> "Devices paired"
     connectionState.status == PresenceConnectionStatus.CONNECTING -> "Connecting to Mac"
     state.services.isNotEmpty() -> "Mac found"
     state.status == DiscoveryStatus.STARTING -> "Starting discovery"
@@ -253,6 +331,12 @@ private fun discoveryMessage(
             "${connectionState.phoneName ?: "this phone"}. The devices remain unpaired."
     connectionState.status == PresenceConnectionStatus.CONNECTING ->
         "Sending this phone's public device identity to the selected Mac."
+    connectionState.status == PresenceConnectionStatus.PAIRING ->
+        "Checking the one-time QR secret and both device identities."
+    connectionState.status == PresenceConnectionStatus.AWAITING_APPROVAL ->
+        "Only approve if the same six-digit code appears on both devices."
+    connectionState.status == PresenceConnectionStatus.PAIRED ->
+        "The Mac identity is stored and the phone's private key remains in Android Keystore."
     state.errorMessage != null -> state.errorMessage
     state.services.isNotEmpty() -> "Select your Mac so it can detect this phone. Secure pairing comes next."
     state.status == DiscoveryStatus.SEARCHING ->
@@ -284,6 +368,7 @@ private fun DiscoveryScreenPreview() {
             onStop = {},
             onConnect = {},
             onDisconnect = {},
+            onScanPairing = {},
         )
     }
 }
