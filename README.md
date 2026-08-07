@@ -14,9 +14,10 @@ over the local network.
 
 ## Development status
 
-The project is in its foundation phase. The first milestone establishes a native
-application shell and the boundaries for pairing, connectivity, protocol,
-security, synchronization, and phone capabilities.
+The project has a native application shell and discovers `_maclink._tcp` Bonjour
+services through Android NSD. It handles Android 17's local-network permission
+and retains a compatibility path for older supported Android versions. Pairing,
+secure transport, and feature synchronization are not implemented yet.
 
 The shared system design is maintained in the parent `MacLink` directory:
 `ARCHITECTURE.md`, `PROTOCOL.md`, and `SECURITY.md`.
@@ -32,4 +33,3 @@ The shared system design is maintained in the parent `MacLink` directory:
 ```sh
 ./gradlew assembleDebug
 ```
-
