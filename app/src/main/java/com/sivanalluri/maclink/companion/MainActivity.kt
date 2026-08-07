@@ -41,19 +41,25 @@ import com.sivanalluri.maclink.companion.discovery.DiscoveredMac
 import com.sivanalluri.maclink.companion.discovery.DiscoveryStatus
 import com.sivanalluri.maclink.companion.discovery.DiscoveryUiState
 import com.sivanalluri.maclink.companion.discovery.MacDiscoveryManager
+import com.sivanalluri.maclink.companion.connection.MacConnectionManager
+import com.sivanalluri.maclink.companion.connection.PresenceConnectionState
+import com.sivanalluri.maclink.companion.connection.PresenceConnectionStatus
 import com.sivanalluri.maclink.companion.ui.theme.MacLinkTheme
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     private lateinit var discoveryManager: MacDiscoveryManager
+    private lateinit var connectionManager: MacConnectionManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         discoveryManager = MacDiscoveryManager(this)
+        connectionManager = MacConnectionManager(this)
         enableEdgeToEdge()
 
         setContent {
             val state by discoveryManager.state.collectAsStateWithLifecycle()
+            val connectionState by connectionManager.state.collectAsStateWithLifecycle()
             val permissionLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestPermission(),
             ) { granted ->
@@ -63,6 +69,7 @@ class MainActivity : ComponentActivity() {
             MacLinkTheme {
                 DiscoveryScreen(
                     state = state,
+                    connectionState = connectionState,
                     onStart = {
                         if (requiresLocalNetworkPermission() && !hasLocalNetworkPermission()) {
                             permissionLauncher.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
@@ -71,6 +78,8 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                     onStop = discoveryManager::stop,
+                    onConnect = connectionManager::connect,
+                    onDisconnect = connectionManager::disconnect,
                 )
             }
         }
@@ -79,6 +88,11 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         discoveryManager.stop()
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        connectionManager.close()
+        super.onDestroy()
     }
 
     private fun requiresLocalNetworkPermission(): Boolean = Build.VERSION.SDK_INT >= 37
@@ -94,8 +108,11 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun DiscoveryScreen(
     state: DiscoveryUiState,
+    connectionState: PresenceConnectionState,
     onStart: () -> Unit,
     onStop: () -> Unit,
+    onConnect: (DiscoveredMac) -> Unit,
+    onDisconnect: () -> Unit,
 ) {
     Scaffold { innerPadding ->
         Column(
@@ -110,13 +127,13 @@ private fun DiscoveryScreen(
             Spacer(Modifier.height(24.dp))
 
             Text(
-                text = discoveryTitle(state),
+                text = discoveryTitle(state, connectionState),
                 style = MaterialTheme.typography.headlineMedium,
                 textAlign = TextAlign.Center,
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                text = discoveryMessage(state),
+                text = discoveryMessage(state, connectionState),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodyLarge,
                 textAlign = TextAlign.Center,
@@ -125,12 +142,22 @@ private fun DiscoveryScreen(
             if (state.services.isNotEmpty()) {
                 Spacer(Modifier.height(24.dp))
                 state.services.take(3).forEach { service ->
-                    MacCard(service)
+                    MacCard(
+                        service = service,
+                        connectionState = connectionState,
+                        onConnect = { onConnect(service) },
+                    )
                     Spacer(Modifier.height(8.dp))
                 }
             }
 
             Spacer(Modifier.height(32.dp))
+            if (connectionState.status == PresenceConnectionStatus.DETECTED ||
+                connectionState.status == PresenceConnectionStatus.CONNECTING
+            ) {
+                OutlinedButton(onClick = onDisconnect) { Text("Disconnect") }
+                Spacer(Modifier.height(8.dp))
+            }
             if (state.isRunning) {
                 OutlinedButton(onClick = onStop) { Text("Stop searching") }
             } else {
@@ -158,7 +185,12 @@ private fun DiscoveryIcon(status: DiscoveryStatus) {
 }
 
 @Composable
-private fun MacCard(service: DiscoveredMac) {
+private fun MacCard(
+    service: DiscoveredMac,
+    connectionState: PresenceConnectionState,
+    onConnect: () -> Unit,
+) {
+    val isSelected = connectionState.selectedMac?.deviceId == service.deviceId
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
             Icon(Icons.Outlined.Computer, contentDescription = null)
@@ -169,11 +201,41 @@ private fun MacCard(service: DiscoveredMac) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall,
             )
+            Spacer(Modifier.height(12.dp))
+            Button(
+                onClick = onConnect,
+                enabled = !isSelected || connectionState.status == PresenceConnectionStatus.ERROR,
+            ) {
+                Text(
+                    when {
+                        isSelected && connectionState.status == PresenceConnectionStatus.CONNECTING ->
+                            "Connecting…"
+                        isSelected && connectionState.status == PresenceConnectionStatus.DETECTED ->
+                            "Detected by Mac"
+                        isSelected && connectionState.status == PresenceConnectionStatus.ERROR ->
+                            "Try again"
+                        else -> "Connect"
+                    },
+                )
+            }
+            if (isSelected && connectionState.errorMessage != null) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    connectionState.errorMessage,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
         }
     }
 }
 
-private fun discoveryTitle(state: DiscoveryUiState): String = when {
+private fun discoveryTitle(
+    state: DiscoveryUiState,
+    connectionState: PresenceConnectionState,
+): String = when {
+    connectionState.status == PresenceConnectionStatus.DETECTED -> "Phone detected by Mac"
+    connectionState.status == PresenceConnectionStatus.CONNECTING -> "Connecting to Mac"
     state.services.isNotEmpty() -> "Mac found"
     state.status == DiscoveryStatus.STARTING -> "Starting discovery"
     state.status == DiscoveryStatus.SEARCHING -> "Looking for MacLink"
@@ -182,9 +244,17 @@ private fun discoveryTitle(state: DiscoveryUiState): String = when {
     else -> "Connect your Mac"
 }
 
-private fun discoveryMessage(state: DiscoveryUiState): String = when {
+private fun discoveryMessage(
+    state: DiscoveryUiState,
+    connectionState: PresenceConnectionState,
+): String = when {
+    connectionState.status == PresenceConnectionStatus.DETECTED ->
+        "${connectionState.selectedMac?.displayName ?: "Your Mac"} can now see " +
+            "${connectionState.phoneName ?: "this phone"}. The devices remain unpaired."
+    connectionState.status == PresenceConnectionStatus.CONNECTING ->
+        "Sending this phone's public device identity to the selected Mac."
     state.errorMessage != null -> state.errorMessage
-    state.services.isNotEmpty() -> "Your Mac is visible and ready for the pairing phase."
+    state.services.isNotEmpty() -> "Select your Mac so it can detect this phone. Secure pairing comes next."
     state.status == DiscoveryStatus.SEARCHING ->
         "Make sure MacLink is open on your Mac and both devices use the same local network."
     else -> "Find MacLink securely on your local network."
@@ -209,9 +279,11 @@ private fun DiscoveryScreenPreview() {
                     ),
                 ),
             ),
+            connectionState = PresenceConnectionState(),
             onStart = {},
             onStop = {},
+            onConnect = {},
+            onDisconnect = {},
         )
     }
 }
-

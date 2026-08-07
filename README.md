@@ -14,10 +14,12 @@ over the local network.
 
 ## Development status
 
-The project has a native application shell and discovers `_maclink._tcp` Bonjour
-services through Android NSD. It handles Android 17's local-network permission
-and retains a compatibility path for older supported Android versions. Pairing,
-secure transport, and feature synchronization are not implemented yet.
+The project has a native application shell, discovers `_maclink._tcp` Bonjour
+services through Android NSD, and can explicitly connect to a selected Mac for a
+bounded pre-pairing presence handshake. It handles Android 17's local-network
+permission and retains a compatibility path for older supported Android
+versions. The detected device remains untrusted. Pairing, secure transport, and
+feature synchronization are not implemented yet.
 
 The shared system design is maintained in the parent `MacLink` directory:
 `ARCHITECTURE.md`, `PROTOCOL.md`, and `SECURITY.md`.
