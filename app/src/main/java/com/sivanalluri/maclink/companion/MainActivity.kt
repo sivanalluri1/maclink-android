@@ -226,7 +226,20 @@ private fun PairingControls(
             )
         }
         PresenceConnectionStatus.PAIRED -> Text(
-            "Secure pairing saved. Encrypted sessions are the next phase.",
+            "Secure pairing saved.",
+            color = MaterialTheme.colorScheme.primary,
+            textAlign = TextAlign.Center,
+            style = MaterialTheme.typography.titleMedium,
+        )
+        PresenceConnectionStatus.AUTHENTICATING -> Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            CircularProgressIndicator()
+            Spacer(Modifier.height(8.dp))
+            Text("Authenticating encrypted session")
+        }
+        PresenceConnectionStatus.CONNECTED -> Text(
+            "Authenticated and encrypted",
             color = MaterialTheme.colorScheme.primary,
             textAlign = TextAlign.Center,
             style = MaterialTheme.typography.titleMedium,
@@ -286,6 +299,10 @@ private fun MacCard(
                             "Confirm code"
                         isSelected && connectionState.status == PresenceConnectionStatus.PAIRED ->
                             "Paired"
+                        isSelected && connectionState.status == PresenceConnectionStatus.AUTHENTICATING ->
+                            "Authenticating…"
+                        isSelected && connectionState.status == PresenceConnectionStatus.CONNECTED ->
+                            "Connected securely"
                         isSelected && connectionState.status == PresenceConnectionStatus.ERROR ->
                             "Try again"
                         else -> "Connect"
@@ -312,6 +329,8 @@ private fun discoveryTitle(
     connectionState.status == PresenceConnectionStatus.PAIRING -> "Verifying Mac"
     connectionState.status == PresenceConnectionStatus.AWAITING_APPROVAL -> "Confirm pairing code"
     connectionState.status == PresenceConnectionStatus.PAIRED -> "Devices paired"
+    connectionState.status == PresenceConnectionStatus.AUTHENTICATING -> "Authenticating devices"
+    connectionState.status == PresenceConnectionStatus.CONNECTED -> "Connected securely"
     connectionState.status == PresenceConnectionStatus.CONNECTING -> "Connecting to Mac"
     state.services.isNotEmpty() -> "Mac found"
     state.status == DiscoveryStatus.STARTING -> "Starting discovery"
@@ -336,6 +355,10 @@ private fun discoveryMessage(
         "Only approve if the same six-digit code appears on both devices."
     connectionState.status == PresenceConnectionStatus.PAIRED ->
         "The Mac identity is stored and the phone's private key remains in Android Keystore."
+    connectionState.status == PresenceConnectionStatus.AUTHENTICATING ->
+        "Creating fresh session keys and verifying both paired device identities."
+    connectionState.status == PresenceConnectionStatus.CONNECTED ->
+        "This session is mutually authenticated and protected with AES-256-GCM."
     state.errorMessage != null -> state.errorMessage
     state.services.isNotEmpty() -> "Select your Mac so it can detect this phone. Secure pairing comes next."
     state.status == DiscoveryStatus.SEARCHING ->

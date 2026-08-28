@@ -10,7 +10,8 @@
         android:icon="@drawable/ic_launcher"
         android:label="MacLink Companion"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        android:theme="@android:style/Theme.Material.Light.NoActionBar"
+        android:usesCleartextTraffic="true">
         <meta-data
             android:name="com.google.mlkit.vision.DEPENDENCIES"
             android:value="barcode_ui" />

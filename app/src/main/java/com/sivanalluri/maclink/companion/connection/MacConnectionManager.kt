@@ -16,12 +16,12 @@ import com.sivanalluri.maclink.companion.pairing.decodeBase64Url
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.nio.ByteBuffer
-import java.nio.charset.CodingErrorAction
 import java.security.KeyFactory
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -29,6 +29,7 @@ import java.security.Signature
 import java.security.spec.X509EncodedKeySpec
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -39,6 +40,8 @@ enum class PresenceConnectionStatus {
     PAIRING,
     AWAITING_APPROVAL,
     PAIRED,
+    AUTHENTICATING,
+    CONNECTED,
     ERROR,
 }
 
@@ -55,16 +58,34 @@ class MacConnectionManager(context: Context) : AutoCloseable {
     private val phoneIdentityStore = PhoneIdentityStore(applicationContext)
     private val pairingIdentityStore by lazy { PairingIdentityStore() }
     private val pairedMacStore = PairedMacStore(applicationContext)
-    private val connectionExecutor = Executors.newSingleThreadExecutor()
     private val pairingExecutor = Executors.newSingleThreadExecutor()
+    private val webSocketClient = OkHttpClient.Builder()
+        .pingInterval(20, TimeUnit.SECONDS)
+        .build()
     private val mutableState = MutableStateFlow(PresenceConnectionState())
     val state: StateFlow<PresenceConnectionState> = mutableState.asStateFlow()
+    private val secureSessionClient by lazy {
+        SecureSessionClient(
+            identityStore = pairingIdentityStore,
+            send = ::sendLine,
+            onConnected = { sessionId ->
+                Log.i(TAG, "Authenticated encrypted session established: $sessionId")
+                mutableState.value = mutableState.value.copy(
+                    status = PresenceConnectionStatus.CONNECTED,
+                    errorMessage = null,
+                )
+            },
+            onFailure = { message ->
+                failSecureSession(message)
+            },
+        )
+    }
 
     @Volatile
     private var generation = 0L
 
     @Volatile
-    private var socket: Socket? = null
+    private var webSocket: WebSocket? = null
 
     @Volatile
     private var pairingContext: ActivePairing? = null
@@ -92,9 +113,10 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         synchronized(this) {
             generation += 1
             currentGeneration = generation
-            socket?.closeQuietly()
-            socket = null
+            webSocket?.cancel()
+            webSocket = null
             pairingContext = null
+            secureSessionClient.reset()
         }
 
         val phoneName = phoneIdentityStore.deviceName()
@@ -104,9 +126,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
             phoneName = phoneName,
         )
 
-        connectionExecutor.execute {
-            connect(currentGeneration, mac, phoneName)
-        }
+        connect(currentGeneration, mac, phoneName)
     }
 
     fun beginPairing(scannedValue: String) {
@@ -178,75 +198,129 @@ class MacConnectionManager(context: Context) : AutoCloseable {
     fun disconnect() {
         synchronized(this) {
             generation += 1
-            socket?.closeQuietly()
-            socket = null
+            webSocket?.close(1000, "User disconnected")
+            webSocket = null
             pairingContext = null
             pendingPairingValue = null
+            secureSessionClient.reset()
         }
         mutableState.value = PresenceConnectionState()
     }
 
     override fun close() {
         disconnect()
-        connectionExecutor.shutdownNow()
         pairingExecutor.shutdownNow()
+        webSocketClient.dispatcher.executorService.shutdown()
+        webSocketClient.connectionPool.evictAll()
     }
 
     private fun connect(currentGeneration: Long, mac: DiscoveredMac, phoneName: String) {
-        var activeSocket: Socket? = null
-        try {
-            activeSocket = connectToFirstAddress(mac)
-            if (!adopt(currentGeneration, activeSocket)) return
+        val request = Request.Builder()
+            .url(webSocketUrl(mac))
+            .header("Sec-WebSocket-Protocol", "maclink.v1")
+            .build()
+        val candidate = webSocketClient.newWebSocket(request, object : WebSocketListener() {
+            private var acknowledged = false
 
-            val presence = DevicePresence(
-                deviceId = phoneIdentityStore.deviceId(),
-                deviceName = phoneName,
-                appVersion = BuildConfig.VERSION_NAME,
-            )
-            activeSocket.soTimeout = HANDSHAKE_TIMEOUT_MILLISECONDS
-            sendLine(presence.toJsonLine().trimEnd())
-
-            val acknowledgement = readBoundedUtf8Line(activeSocket, MAXIMUM_MESSAGE_SIZE)
-            validateAcknowledgement(acknowledgement, mac.deviceId)
-            activeSocket.soTimeout = 0
-
-            if (!isCurrent(currentGeneration, activeSocket)) return
-            val storedPairing = pairedMacStore.load(mac.deviceId)
-            mutableState.value = PresenceConnectionState(
-                status = if (storedPairing == null) {
-                    PresenceConnectionStatus.DETECTED
-                } else {
-                    PresenceConnectionStatus.PAIRED
-                },
-                selectedMac = mac,
-                phoneName = phoneName,
-            )
-
-            pendingPairingValue?.let { scannedValue ->
-                pendingPairingValue = null
-                Log.i(TAG, "Connection restored; continuing secure pairing")
-                beginPairing(scannedValue)
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (!adopt(currentGeneration, webSocket)) return
+                val presence = DevicePresence(
+                    deviceId = phoneIdentityStore.deviceId(),
+                    deviceName = phoneName,
+                    appVersion = BuildConfig.VERSION_NAME,
+                )
+                webSocket.send(presence.toJsonLine().trimEnd())
             }
 
-            while (isCurrent(currentGeneration, activeSocket)) {
-                val message = readBoundedUtf8Line(activeSocket, MAXIMUM_MESSAGE_SIZE)
-                handlePairingMessage(message, mac)
-            }
-        } catch (exception: Exception) {
-            Log.w(TAG, "Mac connection ended: ${exception.javaClass.simpleName}")
-            activeSocket?.closeQuietly()
-            if (isCurrent(currentGeneration, activeSocket)) {
-                synchronized(this) {
-                    if (socket === activeSocket) socket = null
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                if (!isCurrent(currentGeneration, webSocket)) return
+                try {
+                    if (!acknowledged) {
+                        validateAcknowledgement(text, mac.deviceId)
+                        acknowledged = true
+                        val storedPairing = pairedMacStore.load(mac.deviceId)
+                        val nextStatus = if (storedPairing == null) {
+                                PresenceConnectionStatus.DETECTED
+                            } else {
+                                PresenceConnectionStatus.AUTHENTICATING
+                            }
+                        mutableState.value = PresenceConnectionState(
+                            status = nextStatus,
+                            selectedMac = mac,
+                            phoneName = phoneName,
+                        )
+                        if (storedPairing != null) {
+                            secureSessionClient.start(
+                                storedPairing,
+                                phoneIdentityStore.deviceId(),
+                                phoneName,
+                                BuildConfig.VERSION_NAME,
+                            )
+                        }
+                        pendingPairingValue?.let { scannedValue ->
+                            pendingPairingValue = null
+                            Log.i(TAG, "Connection restored; continuing secure pairing")
+                            beginPairing(scannedValue)
+                        }
+                    } else {
+                        handlePairingMessage(text, mac)
+                    }
+                } catch (exception: Exception) {
+                    failConnection(currentGeneration, webSocket, mac, phoneName, exception)
                 }
-                mutableState.value = PresenceConnectionState(
-                    status = PresenceConnectionStatus.ERROR,
-                    selectedMac = mac,
-                    phoneName = phoneName,
-                    errorMessage = exception.message ?: "Unable to reach this Mac.",
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                failConnection(currentGeneration, webSocket, mac, phoneName, t)
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                failConnection(
+                    currentGeneration,
+                    webSocket,
+                    mac,
+                    phoneName,
+                    IllegalStateException("The Mac closed the connection."),
                 )
             }
+        })
+        synchronized(this) {
+            if (generation == currentGeneration) webSocket = candidate else candidate.cancel()
         }
+    }
+
+    private fun failConnection(
+        currentGeneration: Long,
+        candidate: WebSocket,
+        mac: DiscoveredMac,
+        phoneName: String,
+        failure: Throwable,
+    ) {
+        if (!isCurrent(currentGeneration, candidate)) return
+        Log.w(TAG, "Mac connection ended: ${failure.javaClass.simpleName}")
+        synchronized(this) {
+            if (webSocket === candidate) webSocket = null
+            secureSessionClient.reset()
+        }
+        mutableState.value = PresenceConnectionState(
+            status = PresenceConnectionStatus.ERROR,
+            selectedMac = mac,
+            phoneName = phoneName,
+            errorMessage = failure.message ?: "Unable to reach this Mac.",
+        )
+    }
+
+    private fun failSecureSession(message: String) {
+        synchronized(this) {
+            generation += 1
+            webSocket?.cancel()
+            webSocket = null
+            secureSessionClient.reset()
+        }
+        mutableState.value = mutableState.value.copy(
+            status = PresenceConnectionStatus.ERROR,
+            errorMessage = message,
+        )
     }
 
     private fun handlePairingMessage(message: String, mac: DiscoveredMac) {
@@ -254,6 +328,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         when (json.getString("kind")) {
             "pairing_challenge" -> handleChallenge(json, mac)
             "pairing_result" -> handleResult(json, mac)
+            "session_server_hello", "secure_frame" -> secureSessionClient.handle(json)
             "pairing_error" -> {
                 pairingContext = null
                 mutableState.value = mutableState.value.copy(
@@ -339,17 +414,24 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         }) { "The Mac pairing decision signature is invalid." }
 
         if (approved) {
-            pairedMacStore.save(PairedMacRecord(
+            val pairedMac = PairedMacRecord(
                 deviceId = mac.deviceId,
                 deviceName = context.payload.macName,
                 publicKeyDer = macPublicKeyDer,
                 pairedAt = System.currentTimeMillis(),
-            ))
+            )
+            pairedMacStore.save(pairedMac)
             pairingContext = null
             mutableState.value = mutableState.value.copy(
-                status = PresenceConnectionStatus.PAIRED,
+                status = PresenceConnectionStatus.AUTHENTICATING,
                 verificationCode = null,
                 errorMessage = null,
+            )
+            secureSessionClient.start(
+                pairedMac,
+                context.phoneDeviceId,
+                context.phoneName,
+                BuildConfig.VERSION_NAME,
             )
         } else {
             pairingContext = null
@@ -363,44 +445,32 @@ class MacConnectionManager(context: Context) : AutoCloseable {
 
     @Synchronized
     private fun sendLine(message: String) {
-        val activeSocket = socket ?: error("The Mac connection is not open.")
+        val activeSocket = webSocket ?: error("The Mac connection is not open.")
         val bytes = "$message\n".toByteArray(Charsets.UTF_8)
         require(bytes.size <= MAXIMUM_MESSAGE_SIZE) { "The pairing message is too large." }
-        activeSocket.getOutputStream().apply {
-            write(bytes)
-            flush()
-        }
-    }
-
-    private fun connectToFirstAddress(mac: DiscoveredMac): Socket {
-        var lastFailure: Exception? = null
-        for (address in mac.addresses) {
-            val candidate = Socket()
-            try {
-                candidate.tcpNoDelay = true
-                candidate.connect(InetSocketAddress(address, mac.port), CONNECT_TIMEOUT_MILLISECONDS)
-                return candidate
-            } catch (exception: Exception) {
-                candidate.closeQuietly()
-                lastFailure = exception
-            }
-        }
-        throw lastFailure ?: IllegalStateException("The Mac did not provide a reachable address.")
+        check(activeSocket.send(message)) { "The Mac connection cannot accept a message." }
     }
 
     @Synchronized
-    private fun adopt(currentGeneration: Long, candidate: Socket): Boolean {
+    private fun adopt(currentGeneration: Long, candidate: WebSocket): Boolean {
         if (generation != currentGeneration) {
-            candidate.closeQuietly()
+            candidate.cancel()
             return false
         }
-        socket = candidate
+        webSocket = candidate
         return true
     }
 
     @Synchronized
-    private fun isCurrent(currentGeneration: Long, candidate: Socket?): Boolean =
-        generation == currentGeneration && socket === candidate
+    private fun isCurrent(currentGeneration: Long, candidate: WebSocket?): Boolean =
+        generation == currentGeneration && webSocket === candidate
+
+    private fun webSocketUrl(mac: DiscoveredMac): String {
+        val address = mac.addresses.firstOrNull()
+            ?: error("The Mac did not provide a reachable address.")
+        val host = if (':' in address && !address.startsWith("[")) "[$address]" else address
+        return "ws://$host:${mac.port}/maclink"
+    }
 
     private fun validateAcknowledgement(line: String, expectedMacId: UUID) {
         val json = JSONObject(line)
@@ -412,31 +482,8 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         require(json.optString("macName").isNotBlank()) { "The Mac did not provide its name." }
     }
 
-    private fun readBoundedUtf8Line(socket: Socket, maximumBytes: Int): String {
-        val bytes = ByteArrayOutputStream()
-        while (true) {
-            val value = socket.getInputStream().read()
-            require(value != -1) { "The Mac closed the connection before responding." }
-            if (value == '\n'.code) break
-            require(bytes.size() < maximumBytes) { "The Mac response was too large." }
-            bytes.write(value)
-        }
-
-        return Charsets.UTF_8.newDecoder()
-            .onMalformedInput(CodingErrorAction.REPORT)
-            .onUnmappableCharacter(CodingErrorAction.REPORT)
-            .decode(ByteBuffer.wrap(bytes.toByteArray()))
-            .toString()
-    }
-
-    private fun Socket.closeQuietly() {
-        runCatching { close() }
-    }
-
     private companion object {
         const val TAG = "MacLinkConnection"
-        const val CONNECT_TIMEOUT_MILLISECONDS = 5_000
-        const val HANDSHAKE_TIMEOUT_MILLISECONDS = 10_000
-        const val MAXIMUM_MESSAGE_SIZE = 16 * 1024
+        const val MAXIMUM_MESSAGE_SIZE = 1024 * 1024
     }
 }
