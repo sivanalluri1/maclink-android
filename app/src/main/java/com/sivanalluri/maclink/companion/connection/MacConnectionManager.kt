@@ -1,6 +1,7 @@
 package com.sivanalluri.maclink.companion.connection
 
 import android.content.Context
+import android.util.Log
 import com.sivanalluri.maclink.companion.BuildConfig
 import com.sivanalluri.maclink.companion.discovery.DiscoveredMac
 import com.sivanalluri.maclink.companion.pairing.PairedMacRecord
@@ -68,6 +69,9 @@ class MacConnectionManager(context: Context) : AutoCloseable {
     @Volatile
     private var pairingContext: ActivePairing? = null
 
+    @Volatile
+    private var pendingPairingValue: String? = null
+
     private data class ActivePairing(
         val payload: PairingQrPayload,
         val phoneDeviceId: UUID,
@@ -79,6 +83,11 @@ class MacConnectionManager(context: Context) : AutoCloseable {
     )
 
     fun connect(mac: DiscoveredMac) {
+        pendingPairingValue = null
+        connectInternal(mac)
+    }
+
+    private fun connectInternal(mac: DiscoveredMac) {
         val currentGeneration: Long
         synchronized(this) {
             generation += 1
@@ -103,6 +112,12 @@ class MacConnectionManager(context: Context) : AutoCloseable {
     fun beginPairing(scannedValue: String) {
         val currentState = mutableState.value
         val mac = currentState.selectedMac
+        if (mac != null && currentState.status == PresenceConnectionStatus.ERROR) {
+            Log.i(TAG, "Pairing QR scanned after connection loss; reconnecting")
+            pendingPairingValue = scannedValue
+            connectInternal(mac)
+            return
+        }
         if (currentState.status != PresenceConnectionStatus.DETECTED || mac == null) {
             reportPairingError("Connect to the Mac before scanning its pairing code.")
             return
@@ -166,6 +181,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
             socket?.closeQuietly()
             socket = null
             pairingContext = null
+            pendingPairingValue = null
         }
         mutableState.value = PresenceConnectionState()
     }
@@ -206,11 +222,18 @@ class MacConnectionManager(context: Context) : AutoCloseable {
                 phoneName = phoneName,
             )
 
+            pendingPairingValue?.let { scannedValue ->
+                pendingPairingValue = null
+                Log.i(TAG, "Connection restored; continuing secure pairing")
+                beginPairing(scannedValue)
+            }
+
             while (isCurrent(currentGeneration, activeSocket)) {
                 val message = readBoundedUtf8Line(activeSocket, MAXIMUM_MESSAGE_SIZE)
                 handlePairingMessage(message, mac)
             }
         } catch (exception: Exception) {
+            Log.w(TAG, "Mac connection ended: ${exception.javaClass.simpleName}")
             activeSocket?.closeQuietly()
             if (isCurrent(currentGeneration, activeSocket)) {
                 synchronized(this) {
@@ -411,6 +434,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
     }
 
     private companion object {
+        const val TAG = "MacLinkConnection"
         const val CONNECT_TIMEOUT_MILLISECONDS = 5_000
         const val HANDSHAKE_TIMEOUT_MILLISECONDS = 10_000
         const val MAXIMUM_MESSAGE_SIZE = 16 * 1024

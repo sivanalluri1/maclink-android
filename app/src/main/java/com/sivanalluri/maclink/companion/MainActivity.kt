@@ -58,7 +58,6 @@ class MainActivity : ComponentActivity() {
     private val pairingScanner by lazy {
         val options = GmsBarcodeScannerOptions.Builder()
             .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
-            .enableAutoZoom()
             .build()
         GmsBarcodeScanning.getClient(this, options)
     }
