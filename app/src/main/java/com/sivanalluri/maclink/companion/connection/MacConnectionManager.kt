@@ -30,6 +30,7 @@ import java.security.spec.X509EncodedKeySpec
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.ScheduledFuture
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -59,6 +60,12 @@ class MacConnectionManager(context: Context) : AutoCloseable {
     private val pairingIdentityStore by lazy { PairingIdentityStore() }
     private val pairedMacStore = PairedMacStore(applicationContext)
     private val pairingExecutor = Executors.newSingleThreadExecutor()
+    private val recoveryExecutor = Executors.newSingleThreadScheduledExecutor()
+    private val backoff = ReconnectBackoff()
+    private var retry: ScheduledFuture<*>? = null
+    private var stableSession: ScheduledFuture<*>? = null
+    private var reconnectEnabled = false
+    private var latestEndpoint: DiscoveredMac? = null
     private val webSocketClient = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
@@ -69,6 +76,13 @@ class MacConnectionManager(context: Context) : AutoCloseable {
             identityStore = pairingIdentityStore,
             send = ::sendLine,
             onConnected = { sessionId ->
+                val establishedGeneration = generation
+                stableSession?.cancel(false)
+                stableSession = recoveryExecutor.schedule({
+                    synchronized(this) {
+                        if (generation == establishedGeneration) backoff.reset()
+                    }
+                }, 30, TimeUnit.SECONDS)
                 Log.i(TAG, "Authenticated encrypted session established: $sessionId")
                 mutableState.value = mutableState.value.copy(
                     status = PresenceConnectionStatus.CONNECTED,
@@ -103,12 +117,30 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         val transcript: ByteArray? = null,
     )
 
+    @Synchronized
     fun connect(mac: DiscoveredMac) {
+        latestEndpoint = mac
+        reconnectEnabled = true
+        backoff.reset()
         pendingPairingValue = null
         connectInternal(mac)
     }
 
+    @Synchronized
+    fun updateDiscoveredMacs(macs: List<DiscoveredMac>) {
+        val target = mutableState.value.selectedMac ?: return
+        val updated = macs.firstOrNull { it.deviceId == target.deviceId } ?: return
+        latestEndpoint = updated
+        if (reconnectEnabled && mutableState.value.status == PresenceConnectionStatus.ERROR &&
+            (updated.port != target.port || updated.addresses != target.addresses)) {
+            connectInternal(updated)
+        }
+    }
+
+    @Synchronized
     private fun connectInternal(mac: DiscoveredMac) {
+        retry?.cancel(false)
+        stableSession?.cancel(false)
         val currentGeneration: Long
         synchronized(this) {
             generation += 1
@@ -129,6 +161,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         connect(currentGeneration, mac, phoneName)
     }
 
+    @Synchronized
     fun beginPairing(scannedValue: String) {
         val currentState = mutableState.value
         val mac = currentState.selectedMac
@@ -143,7 +176,9 @@ class MacConnectionManager(context: Context) : AutoCloseable {
             return
         }
 
-        pairingExecutor.execute {
+        val pairingGeneration = generation
+        pairingExecutor.execute { synchronized(this) {
+            if (generation != pairingGeneration) return@execute
             try {
                 val payload = PairingQrPayload.parse(scannedValue)
                 require(payload.macDeviceId == mac.deviceId) {
@@ -187,7 +222,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
             } catch (exception: Exception) {
                 reportPairingError(exception.message ?: "Unable to start secure pairing.")
             }
-        }
+        } }
     }
 
     fun reportPairingError(message: String) {
@@ -195,7 +230,11 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         mutableState.value = current.copy(errorMessage = message)
     }
 
+    @Synchronized
     fun disconnect() {
+        reconnectEnabled = false
+        retry?.cancel(false)
+        stableSession?.cancel(false)
         synchronized(this) {
             generation += 1
             webSocket?.close(1000, "User disconnected")
@@ -210,6 +249,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
     override fun close() {
         disconnect()
         pairingExecutor.shutdownNow()
+        recoveryExecutor.shutdownNow()
         webSocketClient.dispatcher.executorService.shutdown()
         webSocketClient.connectionPool.evictAll()
     }
@@ -222,7 +262,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         val candidate = webSocketClient.newWebSocket(request, object : WebSocketListener() {
             private var acknowledged = false
 
-            override fun onOpen(webSocket: WebSocket, response: Response) {
+            override fun onOpen(webSocket: WebSocket, response: Response): Unit = synchronized(this@MacConnectionManager) {
                 if (!adopt(currentGeneration, webSocket)) return
                 val presence = DevicePresence(
                     deviceId = phoneIdentityStore.deviceId(),
@@ -230,9 +270,10 @@ class MacConnectionManager(context: Context) : AutoCloseable {
                     appVersion = BuildConfig.VERSION_NAME,
                 )
                 webSocket.send(presence.toJsonLine().trimEnd())
+                Unit
             }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
+            override fun onMessage(webSocket: WebSocket, text: String): Unit = synchronized(this@MacConnectionManager) {
                 if (!isCurrent(currentGeneration, webSocket)) return
                 try {
                     if (!acknowledged) {
@@ -266,8 +307,10 @@ class MacConnectionManager(context: Context) : AutoCloseable {
                         handlePairingMessage(text, mac)
                     }
                 } catch (exception: Exception) {
-                    failConnection(currentGeneration, webSocket, mac, phoneName, exception)
+                    // Protocol/identity failures require an explicit user retry.
+                    failSecureSession(exception.message ?: "Invalid session message.")
                 }
+                Unit
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -289,6 +332,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         }
     }
 
+    @Synchronized
     private fun failConnection(
         currentGeneration: Long,
         candidate: WebSocket,
@@ -297,6 +341,10 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         failure: Throwable,
     ) {
         if (!isCurrent(currentGeneration, candidate)) return
+        generation += 1
+        val failedGeneration = generation
+        candidate.cancel()
+        stableSession?.cancel(false)
         Log.w(TAG, "Mac connection ended: ${failure.javaClass.simpleName}")
         synchronized(this) {
             if (webSocket === candidate) webSocket = null
@@ -308,9 +356,25 @@ class MacConnectionManager(context: Context) : AutoCloseable {
             phoneName = phoneName,
             errorMessage = failure.message ?: "Unable to reach this Mac.",
         )
+        if (reconnectEnabled && pairedMacStore.load(mac.deviceId) != null) {
+            val delay = backoff.nextDelayMillis()
+            mutableState.value = mutableState.value.copy(
+                errorMessage = "Connection lost. Retrying automatically…",
+            )
+            retry?.cancel(false)
+            retry = recoveryExecutor.schedule({
+                synchronized(this) {
+                    if (reconnectEnabled && generation == failedGeneration) connectInternal(latestEndpoint ?: mac)
+                }
+            }, delay, TimeUnit.MILLISECONDS)
+        }
     }
 
+    @Synchronized
     private fun failSecureSession(message: String) {
+        reconnectEnabled = false
+        retry?.cancel(false)
+        stableSession?.cancel(false)
         synchronized(this) {
             generation += 1
             webSocket?.cancel()

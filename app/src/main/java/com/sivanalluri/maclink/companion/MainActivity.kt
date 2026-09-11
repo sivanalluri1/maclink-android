@@ -1,6 +1,7 @@
 package com.sivanalluri.maclink.companion
 
 import android.Manifest
+import androidx.compose.runtime.LaunchedEffect
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -70,6 +71,9 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val state by discoveryManager.state.collectAsStateWithLifecycle()
+            LaunchedEffect(state.services) {
+                connectionManager.updateDiscoveredMacs(state.services)
+            }
             val connectionState by connectionManager.state.collectAsStateWithLifecycle()
             val permissionLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestPermission(),
