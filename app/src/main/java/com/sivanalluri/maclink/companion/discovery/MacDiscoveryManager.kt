@@ -23,6 +23,7 @@ class MacDiscoveryManager(context: Context) {
     val state: StateFlow<DiscoveryUiState> = mutableState.asStateFlow()
 
     private var running = false
+    private var generation = 0L
     private var modernCallback: NsdManager.ServiceInfoCallback? = null
     private var legacyListener: NsdManager.DiscoveryListener? = null
     private var multicastLock: WifiManager.MulticastLock? = null
@@ -31,6 +32,7 @@ class MacDiscoveryManager(context: Context) {
         if (running) return
 
         running = true
+        generation += 1
         mutableState.value = DiscoveryUiState(status = DiscoveryStatus.STARTING)
         acquireMulticastLock()
 
@@ -50,6 +52,7 @@ class MacDiscoveryManager(context: Context) {
     fun stop() {
         if (!running) return
         running = false
+        generation += 1
 
         if (Build.VERSION.SDK_INT >= 37) {
             modernCallback?.let { callback ->
@@ -77,21 +80,25 @@ class MacDiscoveryManager(context: Context) {
 
     @RequiresApi(37)
     private fun startModernDiscovery() {
+        val expectedGeneration = generation
         val request = DiscoveryRequest.Builder(MacLinkServiceContract.SERVICE_TYPE).build()
         val callback = object : NsdManager.ServiceInfoCallback {
             override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
+                if (generation != expectedGeneration || !running) return
                 fail("Discovery registration failed ($errorCode).")
             }
 
             override fun onServiceInfoCallbackRegistered() {
-                if (running) updateStatus(DiscoveryStatus.SEARCHING)
+                if (running && generation == expectedGeneration) updateStatus(DiscoveryStatus.SEARCHING)
             }
 
             override fun onServiceUpdated(serviceInfo: NsdServiceInfo) {
+                if (generation != expectedGeneration || !running) return
                 serviceInfo.toDiscoveredMac()?.let(::upsert)
             }
 
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {
+                if (generation != expectedGeneration || !running) return
                 remove(serviceInfo.serviceName)
             }
 
@@ -106,26 +113,32 @@ class MacDiscoveryManager(context: Context) {
 
     @Suppress("DEPRECATION")
     private fun startLegacyDiscovery() {
+        val expectedGeneration = generation
+        fun current(action: () -> Unit) {
+            callbackExecutor.execute {
+                if (running && generation == expectedGeneration) action()
+            }
+        }
         val listener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) {
-                if (running) updateStatus(DiscoveryStatus.SEARCHING)
+                current { updateStatus(DiscoveryStatus.SEARCHING) }
             }
 
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
                 if (!serviceInfo.serviceType.startsWith("_maclink._tcp")) return
-                resolveLegacy(serviceInfo)
+                current { resolveLegacy(serviceInfo) }
             }
 
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {
-                remove(serviceInfo.serviceName)
+                current { remove(serviceInfo.serviceName) }
             }
 
             override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
-                fail("Discovery failed to start ($errorCode).")
+                current { fail("Discovery failed to start ($errorCode).") }
             }
 
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
-                fail("Discovery failed to stop ($errorCode).")
+                current { fail("Discovery failed to stop ($errorCode).") }
             }
 
             override fun onDiscoveryStopped(serviceType: String) = Unit
@@ -141,12 +154,15 @@ class MacDiscoveryManager(context: Context) {
 
     @Suppress("DEPRECATION")
     private fun resolveLegacy(serviceInfo: NsdServiceInfo) {
+        val expectedGeneration = generation
         val listener = object : NsdManager.ResolveListener {
             override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) = Unit
 
             override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
                 callbackExecutor.execute {
-                    serviceInfo.toDiscoveredMac()?.let(::upsert)
+                    if (running && generation == expectedGeneration) {
+                        serviceInfo.toDiscoveredMac()?.let(::upsert)
+                    }
                 }
             }
         }
@@ -195,10 +211,7 @@ class MacDiscoveryManager(context: Context) {
     }
 
     private fun fail(message: String) {
-        running = false
-        modernCallback = null
-        legacyListener = null
-        releaseMulticastLock()
+        stop()
         mutableState.value = DiscoveryUiState(
             status = DiscoveryStatus.ERROR,
             errorMessage = message,

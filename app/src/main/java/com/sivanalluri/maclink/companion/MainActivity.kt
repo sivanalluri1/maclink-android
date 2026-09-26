@@ -1,7 +1,8 @@
 package com.sivanalluri.maclink.companion
 
 import android.Manifest
-import androidx.compose.runtime.LaunchedEffect
+import androidx.activity.viewModels
+import com.sivanalluri.maclink.companion.connection.ConnectionViewModel
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -54,8 +55,9 @@ import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
-    private lateinit var discoveryManager: MacDiscoveryManager
-    private lateinit var connectionManager: MacConnectionManager
+    private val connectionOwner: ConnectionViewModel by viewModels()
+    private val discoveryManager get() = connectionOwner.discovery
+    private val connectionManager get() = connectionOwner.connection
     private val pairingScanner by lazy {
         val options = GmsBarcodeScannerOptions.Builder()
             .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
@@ -65,15 +67,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        discoveryManager = MacDiscoveryManager(this)
-        connectionManager = MacConnectionManager(this)
         enableEdgeToEdge()
 
         setContent {
             val state by discoveryManager.state.collectAsStateWithLifecycle()
-            LaunchedEffect(state.services) {
-                connectionManager.updateDiscoveredMacs(state.services)
-            }
             val connectionState by connectionManager.state.collectAsStateWithLifecycle()
             val permissionLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestPermission(),
@@ -102,13 +99,13 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
-        discoveryManager.stop()
+        connectionOwner.background()
         super.onStop()
     }
 
-    override fun onDestroy() {
-        connectionManager.close()
-        super.onDestroy()
+    override fun onStart() {
+        super.onStart()
+        connectionOwner.foreground()
     }
 
     private fun requiresLocalNetworkPermission(): Boolean = Build.VERSION.SDK_INT >= 37

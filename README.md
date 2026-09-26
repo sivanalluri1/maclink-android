@@ -20,8 +20,27 @@ bounded pre-pairing presence handshake. It now scans the Mac's short-lived QR
 code without requesting camera permission, keeps its P-256 signing identity in
 Android Keystore, verifies the pairing transcript, and stores approved Mac
 public identities. It handles Android 17's local-network permission and retains
-a compatibility path for older supported Android versions. Encrypted session
-transport and feature synchronization are not implemented yet.
+a compatibility path for older supported Android versions. Paired peers establish
+authenticated encrypted sessions. Recovery includes jittered retries, refreshed
+discovery endpoints, default-network change handling, and 20-second connection
+and authentication deadlines. A ViewModel retains the connection across screen
+rotation; discovery resumes when the Activity returns to the foreground.
+
+Background-service ownership, process-death restoration, snapshot reconciliation,
+and feature synchronization remain pending. These builds are development-only;
+the custom session protocol still requires independent security review.
+
+## Recovery verification
+
+After pairing, keep discovery running and verify Wi-Fi off/on recovery. Rotate
+the phone and confirm the connected session is retained. Open the QR scanner
+and return to confirm discovery resumes. Explicit Disconnect must prevent retries.
+Physical Pixel testing is still required for these lifecycle/network changes.
+
+Network callbacks wait for link properties before triggering recovery, following
+[Android's network-state guidance](https://developer.android.com/develop/connectivity/network-ops/reading-network-state).
+Connection ownership follows the
+[ViewModel lifecycle](https://developer.android.com/topic/libraries/architecture/viewmodel).
 
 The shared system design is maintained in the parent `MacLink` directory:
 `ARCHITECTURE.md`, `PROTOCOL.md`, and `SECURITY.md`.

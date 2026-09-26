@@ -64,6 +64,9 @@ class MacConnectionManager(context: Context) : AutoCloseable {
     private val backoff = ReconnectBackoff()
     private var retry: ScheduledFuture<*>? = null
     private var stableSession: ScheduledFuture<*>? = null
+    private var handshakeDeadline: ScheduledFuture<*>? = null
+    private val deadlineToken = DeadlineToken()
+    private var closed = false
     private var reconnectEnabled = false
     private var latestEndpoint: DiscoveredMac? = null
     private val webSocketClient = OkHttpClient.Builder()
@@ -76,6 +79,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
             identityStore = pairingIdentityStore,
             send = ::sendLine,
             onConnected = { sessionId ->
+                cancelHandshakeDeadline()
                 val establishedGeneration = generation
                 stableSession?.cancel(false)
                 stableSession = recoveryExecutor.schedule({
@@ -119,6 +123,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
 
     @Synchronized
     fun connect(mac: DiscoveredMac) {
+        if (closed) return
         latestEndpoint = mac
         reconnectEnabled = true
         backoff.reset()
@@ -128,6 +133,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
 
     @Synchronized
     fun updateDiscoveredMacs(macs: List<DiscoveredMac>) {
+        if (closed) return
         val target = mutableState.value.selectedMac ?: return
         val updated = macs.firstOrNull { it.deviceId == target.deviceId } ?: return
         latestEndpoint = updated
@@ -139,8 +145,10 @@ class MacConnectionManager(context: Context) : AutoCloseable {
 
     @Synchronized
     private fun connectInternal(mac: DiscoveredMac) {
+        if (closed) return
         retry?.cancel(false)
         stableSession?.cancel(false)
+        cancelHandshakeDeadline()
         val currentGeneration: Long
         synchronized(this) {
             generation += 1
@@ -159,10 +167,44 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         )
 
         connect(currentGeneration, mac, phoneName)
+        armHandshakeDeadline()
+    }
+
+    /** Called after the default network's link properties become available. */
+    @Synchronized
+    fun networkChanged() {
+        if (closed || !reconnectEnabled) return
+        val mac = latestEndpoint ?: return
+        // A QR/approval exchange must not be restarted automatically.
+        if (pairedMacStore.load(mac.deviceId) != null) connectInternal(mac)
+    }
+
+    private fun armHandshakeDeadline() {
+        cancelHandshakeDeadline()
+        val token = deadlineToken.invalidate()
+        val expectedGeneration = generation
+        val socket = webSocket ?: return
+        val mac = mutableState.value.selectedMac ?: return
+        val phoneName = mutableState.value.phoneName ?: return
+        handshakeDeadline = recoveryExecutor.schedule({
+            synchronized(this) {
+                if (deadlineToken.isCurrent(token) && isCurrent(expectedGeneration, socket)) {
+                    failConnection(expectedGeneration, socket, mac, phoneName,
+                        java.net.SocketTimeoutException("Connection handshake timed out."))
+                }
+            }
+        }, 20, TimeUnit.SECONDS)
+    }
+
+    private fun cancelHandshakeDeadline() {
+        deadlineToken.invalidate()
+        handshakeDeadline?.cancel(false)
+        handshakeDeadline = null
     }
 
     @Synchronized
     fun beginPairing(scannedValue: String) {
+        if (closed) return
         val currentState = mutableState.value
         val mac = currentState.selectedMac
         if (mac != null && currentState.status == PresenceConnectionStatus.ERROR) {
@@ -235,6 +277,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         reconnectEnabled = false
         retry?.cancel(false)
         stableSession?.cancel(false)
+        cancelHandshakeDeadline()
         synchronized(this) {
             generation += 1
             webSocket?.close(1000, "User disconnected")
@@ -246,7 +289,10 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         mutableState.value = PresenceConnectionState()
     }
 
+    @Synchronized
     override fun close() {
+        if (closed) return
+        closed = true
         disconnect()
         pairingExecutor.shutdownNow()
         recoveryExecutor.shutdownNow()
@@ -279,6 +325,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
                     if (!acknowledged) {
                         validateAcknowledgement(text, mac.deviceId)
                         acknowledged = true
+                        cancelHandshakeDeadline()
                         val storedPairing = pairedMacStore.load(mac.deviceId)
                         val nextStatus = if (storedPairing == null) {
                                 PresenceConnectionStatus.DETECTED
@@ -291,6 +338,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
                             phoneName = phoneName,
                         )
                         if (storedPairing != null) {
+                            armHandshakeDeadline()
                             secureSessionClient.start(
                                 storedPairing,
                                 phoneIdentityStore.deviceId(),
@@ -315,6 +363,11 @@ class MacConnectionManager(context: Context) : AutoCloseable {
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 failConnection(currentGeneration, webSocket, mac, phoneName, t)
+            }
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                failConnection(currentGeneration, webSocket, mac, phoneName,
+                    IllegalStateException("The Mac is closing the connection."))
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
@@ -345,6 +398,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         val failedGeneration = generation
         candidate.cancel()
         stableSession?.cancel(false)
+        cancelHandshakeDeadline()
         Log.w(TAG, "Mac connection ended: ${failure.javaClass.simpleName}")
         synchronized(this) {
             if (webSocket === candidate) webSocket = null
@@ -375,6 +429,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
         reconnectEnabled = false
         retry?.cancel(false)
         stableSession?.cancel(false)
+        cancelHandshakeDeadline()
         synchronized(this) {
             generation += 1
             webSocket?.cancel()
@@ -491,6 +546,7 @@ class MacConnectionManager(context: Context) : AutoCloseable {
                 verificationCode = null,
                 errorMessage = null,
             )
+            armHandshakeDeadline()
             secureSessionClient.start(
                 pairedMac,
                 context.phoneDeviceId,
